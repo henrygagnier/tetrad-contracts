@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {VRFCoordinatorV2Interface} from "@chainlink/contracts@1.1.0/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
-import {VRFConsumerBaseV2} from "@chainlink/contracts@1.1.0/src/v0.8/vrf/VRFConsumerBaseV2.sol";
+import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
+import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
+import "./interfaces/ITetradLottery.sol";
 
 contract RandomNumberGenerator is VRFConsumerBaseV2 {
     event RequestSent(uint256 requestId, uint32 numWords);
@@ -16,7 +17,8 @@ contract RandomNumberGenerator is VRFConsumerBaseV2 {
     }
 
     mapping(uint256 => RequestStatus) public requests;
-    VRFCoordinatorV2Interface COORDINATOR;
+    VRFCoordinatorV2Interface coordinator;
+    ITetradLottery lottery;
 
     uint64 subscriptionId;
 
@@ -26,15 +28,21 @@ contract RandomNumberGenerator is VRFConsumerBaseV2 {
     uint32 callbackGasLimit = 500000;
     uint16 requestConfirmations = 3;
 
+    modifier onlyLottery() {
+        if (msg.sender != address(lottery)) revert();
+        _;
+    }
+
     constructor(uint64 _subscriptionId, address _coordinator, address _lottery)
         VRFConsumerBaseV2(_coordinator)
     {
-        COORDINATOR = VRFCoordinatorV2Interface(_coordinator);
+        coordinator = VRFCoordinatorV2Interface(_coordinator);
+        lottery = ITetradLottery(_lottery);
         subscriptionId = _subscriptionId;
     }
 
-    function generate(uint256 _id) external returns (uint256 requestId) {
-        requestId = COORDINATOR.requestRandomWords(
+    function generate(uint256 _id) external onlyLottery() returns (uint256 requestId) {
+        requestId = coordinator.requestRandomWords(
             keyHash,
             subscriptionId,
             requestConfirmations,
@@ -57,7 +65,7 @@ contract RandomNumberGenerator is VRFConsumerBaseV2 {
     ) internal override {
         require(requests[_requestId].exists, "request not found");
         uint256 lotteryId = requests[_requestId].lotteryId;
-        //makeLotteryClaimable(lotteryId, _randomWords[0]);
+        lottery.makeLotteryClaimable(lotteryId, _randomWords[0]);
         emit RequestFulfilled(_requestId, _randomWords);
     }
 }
