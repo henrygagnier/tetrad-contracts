@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
+import "./interfaces/IRandomNumberGenerator.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-contract TetradLottery {
+contract TetradLottery is Ownable {
     struct Lottery {
         uint256[6] rewardsPerBracket;
         uint256[6] countWinnersPerBracket;
         uint256 firstTicketId;
+        uint256 lastTicketId;
         uint256 amountCollected;
         uint256 totalAmountCollected;
-        uint256 requestId;
         uint32 finalNumber;
     }
 
@@ -25,6 +26,7 @@ contract TetradLottery {
 
     uint256 public price = 500000000000000;
     uint256 currentTicketId;
+    uint256 lastLotteryPurchased;
 
     mapping(uint256 => mapping(uint32 => uint256))
         private _numberTicketsPerLotteryId;
@@ -32,7 +34,12 @@ contract TetradLottery {
         private _userTicketIdsPerLotteryId;
     mapping(uint32 => uint32) private bracketCalculator;
 
-    VRFCoordinatorV2Interface internal randomNumberGenerator;
+    IRandomNumberGenerator internal randomNumberGenerator;
+
+    modifier onlyRandomNumberGenerator() {
+        if (msg.sender != address(randomNumberGenerator)) revert();
+        _;
+    }
 
     event LotteryNumberDrawn(
         uint256 indexed lotteryId,
@@ -51,11 +58,36 @@ contract TetradLottery {
         uint256 numberTickets
     );
 
+    constructor(address _randomNumberGenerator) Ownable() {
+        randomNumberGenerator = IRandomNumberGenerator(_randomNumberGenerator);
+
+        bracketCalculator[0] = 1;
+        bracketCalculator[1] = 11;
+        bracketCalculator[2] = 111;
+        bracketCalculator[3] = 1111;
+        bracketCalculator[4] = 11111;
+        bracketCalculator[5] = 111111;
+
+        rewardsBreakdown[0] = 1500;
+        rewardsBreakdown[1] = 1750;
+        rewardsBreakdown[2] = 2000;
+        rewardsBreakdown[3] = 2250;
+        rewardsBreakdown[4] = 1000;
+        rewardsBreakdown[5] = 1500;
+    }
+
     function buyTickets(uint32[] calldata _numbers) external payable {
         if (_numbers.length == 0) revert();
         if (_numbers.length * price != msg.value) revert();
 
         uint256 id = block.timestamp / 24 hours;
+
+        if (lotteries[id].amountCollected == 0) {
+            lotteries[id].firstTicketId = currentTicketId;
+            if (lotteries[id - 1].amountCollected != 0 && lotteries[id - 1].lastTicketId == 0) {
+                lotteries[id - 1].lastTicketId = currentTicketId - 1;
+            }
+        }
 
         for (uint256 i = 0; i < _numbers.length; i++) {
             uint32 thisTicketNumber = _numbers[i];
@@ -86,6 +118,8 @@ contract TetradLottery {
 
         lotteries[id].amountCollected += (msg.value);
         lotteries[id].totalAmountCollected += (msg.value);
+
+        emit TicketsPurchase(msg.sender, id, _numbers.length);
     }
 
     function claimTickets(
@@ -100,12 +134,12 @@ contract TetradLottery {
         uint256 rewardToTransfer;
 
         for (uint256 i = 0; i < _ticketIds.length; i++) {
-            require(_brackets[i] < 6, "Bracket out of range"); // Must be between 0 and 5
+            require(_brackets[i] < 6, "Bracket out of range");
 
             uint256 thisTicketId = _ticketIds[i];
 
             require(
-                lotteries[_id + 1].firstTicketId > thisTicketId,
+                lotteries[_id].lastTicketId > thisTicketId,
                 "TicketId too high"
             );
             require(
@@ -136,12 +170,8 @@ contract TetradLottery {
                     "Bracket must be higher"
                 );
             }
-
-            // Increment the reward to transfer
             rewardToTransfer += rewardForTicketId;
         }
-
-        // Transfer money to msg.sender
         (bool sent, ) = (msg.sender).call{value: rewardToTransfer}("");
         if (!sent) revert();
 
@@ -170,12 +200,14 @@ contract TetradLottery {
 
     function drawLottery(uint256 _id) external {
         if ((block.timestamp / 24 hours) <= _id) revert();
-        if (lotteries[_id].finalNumber == 0) revert();
-        lotteries[_id + 1].firstTicketId = currentTicketId + 1;
-        //lotteries[_id].requestId = generate(_id);
+        if (lotteries[_id].finalNumber != 0) revert();
+        if (lotteries[_id].amountCollected == 0) revert(); //if there are no participants
+
+        lotteries[_id].lastTicketId = currentTicketId - 1;
+        randomNumberGenerator.generate(_id);
     }
 
-    function makeLotteryClaimable(uint256 _id, uint256 _result) internal {
+    function makeLotteryClaimable(uint256 _id, uint256 _result) external onlyRandomNumberGenerator() {
         uint32 finalNumber = uint32(1000000 + (_result % 1000000));
 
         uint256 numberAddressesInPreviousBracket;
@@ -221,5 +253,61 @@ contract TetradLottery {
         }
 
         lotteries[_id].finalNumber = finalNumber;
+
+        emit LotteryNumberDrawn(_id, finalNumber, numberAddressesInPreviousBracket);
+    }
+
+     function viewUserInfoForLotteryId(
+        address _user,
+        uint256 _lotteryId,
+        uint256 _cursor,
+        uint256 _size
+    )
+        external
+        view
+        returns (
+            uint256[] memory,
+            uint32[] memory,
+            bool[] memory,
+            uint256
+        )
+    {
+        uint256 length = _size;
+        uint256 numberTicketsBoughtAtLotteryId = _userTicketIdsPerLotteryId[_user][_lotteryId].length;
+
+        if (length > (numberTicketsBoughtAtLotteryId - _cursor)) {
+            length = numberTicketsBoughtAtLotteryId - _cursor;
+        }
+
+        uint256[] memory lotteryTicketIds = new uint256[](length);
+        uint32[] memory ticketNumbers = new uint32[](length);
+        bool[] memory ticketStatuses = new bool[](length);
+
+        for (uint256 i = 0; i < length; i++) {
+            lotteryTicketIds[i] = _userTicketIdsPerLotteryId[_user][_lotteryId][i + _cursor];
+            ticketNumbers[i] = tickets[lotteryTicketIds[i]].number;
+
+            // True = ticket claimed
+            if (tickets[lotteryTicketIds[i]].owner == address(0)) {
+                ticketStatuses[i] = true;
+            } else {
+                // ticket not claimed (includes the ones that cannot be claimed)
+                ticketStatuses[i] = false;
+            }
+        }
+
+        return (lotteryTicketIds, ticketNumbers, ticketStatuses, _cursor + length);
+    }
+
+    function viewCurrentLotteryId() external view returns(uint256) {
+        return(block.timestamp / 24 hours);
+    }
+
+    function changeRandomNumberGenerator(address _newRandomNumberGenerator) external onlyOwner {
+        randomNumberGenerator = IRandomNumberGenerator(_newRandomNumberGenerator);
+    }
+
+    function viewLottery(uint256 _lotteryId) external view returns (Lottery memory) {
+        return lotteries[_lotteryId];
     }
 }
